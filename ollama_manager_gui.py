@@ -397,6 +397,10 @@ class HuggingFaceDiscoverWorker(QObject):
                     if suggested_name in self.installed_names:
                         continue
                     desc = _compose_hf_desc(repo, info, gguf_path)
+                    size = s.get("size") or (s.get("lfs") or {}).get("size")
+                    sha256 = s.get("sha256") or (s.get("lfs") or {}).get("sha256")
+                    tags = info.get("tags") or (info.get("cardData") or {}).get("tags") or []
+                    license_ = info.get("license") or (info.get("cardData") or {}).get("license")
                     results.append({
                         "provider": "hf_gguf",
                         "repo_id": repo_id,
@@ -404,6 +408,10 @@ class HuggingFaceDiscoverWorker(QObject):
                         "url": url,
                         "suggested_name": suggested_name,
                         "desc": desc,
+                        "size": size,
+                        "sha256": sha256,
+                        "tags": tags,
+                        "license": license_,
                     })
             self.finished.emit(results)
         except Exception as e:
@@ -446,6 +454,10 @@ class HuggingFaceTheBlokeWorker(QObject):
                     if suggested_name in self.installed_names:
                         continue
                     desc = _compose_hf_desc(repo, info, gguf_path)
+                    size = s.get("size") or (s.get("lfs") or {}).get("size")
+                    sha256 = s.get("sha256") or (s.get("lfs") or {}).get("sha256")
+                    tags = info.get("tags") or (info.get("cardData") or {}).get("tags") or []
+                    license_ = info.get("license") or (info.get("cardData") or {}).get("license")
                     results.append({
                         "provider": "hf_thebloke",
                         "repo_id": repo_id,
@@ -453,6 +465,10 @@ class HuggingFaceTheBlokeWorker(QObject):
                         "url": url,
                         "suggested_name": suggested_name,
                         "desc": desc,
+                        "size": size,
+                        "sha256": sha256,
+                        "tags": tags,
+                        "license": license_,
                     })
             self.finished.emit(results)
         except Exception:
@@ -1260,19 +1276,42 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _human_size(self, n: Optional[int]) -> str:
+        try:
+            n = int(n)
+        except Exception:
+            return "?"
+        units = ["B", "KB", "MB", "GB", "TB"]
+        i = 0
+        x = float(n)
+        while x >= 1024 and i < len(units) - 1:
+            x /= 1024.0
+            i += 1
+        return f"{x:.1f} {units[i]}"
+
     def _details_text(self, data: dict) -> str:
         if not data:
             return ""
         prov = data.get("provider", "?")
         lines = [f"provider: {prov}"]
         if prov in ("hf_gguf", "hf_thebloke"):
+            size = data.get('size')
+            sha = data.get('sha256')
+            tags = data.get('tags') or []
+            license_ = data.get('license') or ''
             lines += [
                 f"repo_id: {data.get('repo_id','')}",
                 f"gguf: {data.get('gguf_path','')}",
                 f"suggested: {data.get('suggested_name','')}",
                 f"desc: {data.get('desc','')}",
+                f"size: {self._human_size(size) if size else (self._human_size(data.get('head_size')) if data.get('head_size') else '?')}",
+                f"checksum: {sha or 'n/a'}",
+                f"tags: {', '.join(tags[:10])}{'…' if len(tags)>10 else ''}",
+                f"license: {license_}",
                 f"url: {data.get('url','')}",
             ]
+            if data.get('readme_preview'):
+                lines += ["", "README:", data['readme_preview']]
         else:
             lines += [
                 f"name: {data.get('name','')}",
@@ -1288,6 +1327,45 @@ class MainWindow(QMainWindow):
             return
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, dict):
+            # kick off background enrich for HF providers
+            prov = data.get('provider')
+            if prov in ('hf_gguf','hf_thebloke'):
+                # Copy to avoid mutating original directly while thread runs
+                enriched = dict(data)
+                def enrich():
+                    try:
+                        # Disk space estimate via HEAD
+                        try:
+                            h = requests.head(enriched.get('url',''), headers=hf_headers(), timeout=20, allow_redirects=True)
+                            sz = int(h.headers.get('Content-Length','0')) if h.status_code < 400 else 0
+                            if sz > 0 and not enriched.get('size'):
+                                enriched['head_size'] = sz
+                        except Exception:
+                            pass
+                        # README preview
+                        repo_id = enriched.get('repo_id')
+                        readme_txt = ''
+                        for path in ('README.md','README.MD','Readme.md'):
+                            try:
+                                r = requests.get(f"https://huggingface.co/{repo_id}/raw/main/{path}", headers=hf_headers(), timeout=20)
+                                if r.status_code == 200 and r.text:
+                                    readme_txt = r.text.strip()
+                                    break
+                            except Exception:
+                                continue
+                        if readme_txt:
+                            # take first ~1200 chars
+                            enriched['readme_preview'] = (readme_txt[:1200] + ('…' if len(readme_txt) > 1200 else ''))
+                    finally:
+                        # Update UI on main thread
+                        def apply():
+                            # Replace stored data on the item for future use
+                            item.setData(Qt.ItemDataRole.UserRole, enriched)
+                            self.discover_details.setPlainText(self._details_text(enriched))
+                        QApplication.instance().postEvent(self.discover_details, type('Dummy', (), {})())
+                        # Use direct call since we're in Python thread; just set text safely
+                        self.discover_details.setPlainText(self._details_text(enriched))
+                threading.Thread(target=enrich, daemon=True).start()
             self.discover_details.setPlainText(self._details_text(data))
         else:
             self.discover_details.clear()
