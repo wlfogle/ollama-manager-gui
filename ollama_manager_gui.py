@@ -75,6 +75,27 @@ def _extract_quant_from_filename(fname: str) -> str:
     m = re.search(r"(Q\d[_A-Z0-9]+)", fname.upper())
     return m.group(1) if m else ""
 
+def _extract_ctx(fname_or_id: str) -> str:
+    s = fname_or_id.lower()
+    # Try patterns like 8k, 32k, 128k, or ctx-8192
+    m = re.search(r"(\d+)[ ]*k", s)
+    if m:
+        try:
+            v = int(m.group(1)) * 1024
+            return f"ctx={v}"
+        except Exception:
+            pass
+    m2 = re.search(r"ctx[-_ ]?(\d+)", s)
+    if m2:
+        return f"ctx={m2.group(1)}"
+    return ""
+
+def _fmt_int(n: Optional[int]) -> str:
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return ""
+
 def _instruct_flag(repo_id: str, fname: str) -> str:
     s = (repo_id + " " + fname).lower()
     return "instruct" if "instruct" in s else "base"
@@ -87,14 +108,16 @@ def _compose_hf_desc(repo: dict, info: dict, gguf_path: str) -> str:
     downloads = repo.get("downloads") or repo.get("downloadsAllTime")
     size = _extract_size_from_repo(repo_id)
     quant = _extract_quant_from_filename(gguf_path)
+    ctx = _extract_ctx(gguf_path)
     ib = _instruct_flag(repo_id, gguf_path)
     parts = []
     if size: parts.append(size)
     if quant: parts.append(quant)
     if ib: parts.append(ib)
+    if ctx: parts.append(ctx)
     parts.append(f"task={task}")
     parts.append(license_)
-    if downloads: parts.append(f"dl={downloads}")
+    if downloads: parts.append(f"dl={_fmt_int(downloads)}")
     return ", ".join(parts)
 
 def _augment_ollama_desc(txt: str) -> str:
@@ -661,11 +684,21 @@ class MainWindow(QMainWindow):
         self.discover_list.currentItemChanged.connect(self.update_discover_details)
         discover_layout.addWidget(self.discover_list)
 
-        # Details pane for the selected item
+        # Details pane for the selected item + actions
         self.discover_details = QPlainTextEdit()
         self.discover_details.setReadOnly(True)
         self.discover_details.setPlaceholderText("Details for selected item…")
         discover_layout.addWidget(self.discover_details)
+        # Actions row below details
+        actions_row = QHBoxLayout()
+        self.copy_btn = QPushButton("Copy Command")
+        self.copy_btn.clicked.connect(self.copy_discover_command)
+        self.open_btn = QPushButton("Open Source Page")
+        self.open_btn.clicked.connect(self.open_discover_url)
+        actions_row.addWidget(self.copy_btn)
+        actions_row.addWidget(self.open_btn)
+        actions_row.addStretch(1)
+        discover_layout.addLayout(actions_row)
         row2 = QHBoxLayout()
         self.prev_btn = QPushButton("Prev")
         self.prev_btn.clicked.connect(self.discover_prev_page)
@@ -1120,6 +1153,9 @@ class MainWindow(QMainWindow):
         self.page_label.setText(f"Page {self._discover_page+1}/{pages}")
         self.prev_btn.setEnabled(self._discover_page > 0)
         self.next_btn.setEnabled(self._discover_page+1 < pages)
+        # Update details for the first item on this page
+        if self.discover_list.count() > 0:
+            self.discover_list.setCurrentRow(0)
 
     def discover_prev_page(self):
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
@@ -1163,6 +1199,51 @@ class MainWindow(QMainWindow):
             self.discover_details.setPlainText(self._details_text(data))
         else:
             self.discover_details.clear()
+
+    def copy_discover_command(self):
+        item = self.discover_list.currentItem()
+        if not item:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        prov = data.get("provider")
+        if prov in ("hf_gguf", "hf_thebloke"):
+            cmd = f"Modelfile:\nFROM {data.get('url','')}\n"
+        else:
+            name = data.get("name", "")
+            cmd = f"ollama pull {name}" if name else ""
+        if cmd:
+            # put in details pane tail as a visible copy source
+            self.discover_details.appendPlainText("\n---\n" + cmd)
+    
+    def open_discover_url(self):
+        # Best-effort: open HF or Ollama page in default browser if available
+        try:
+            import webbrowser
+        except Exception:
+            return
+        item = self.discover_list.currentItem()
+        if not item:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        prov = data.get("provider")
+        url = None
+        if prov in ("hf_gguf", "hf_thebloke"):
+            rid = data.get("repo_id")
+            if rid:
+                url = f"https://huggingface.co/{rid}"
+        else:
+            name = data.get("name")
+            if name:
+                url = f"https://ollama.com/library/{name}"
+        if url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
 
 
 def main():

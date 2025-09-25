@@ -1,0 +1,18 @@
+[project]
+name = "ollama-manager-gui"
+version = "0.1.1"
+description = "GUI for managing Ollama models: list/update/delete, maintenance, and discovery/download."
+authors = [{ name = "wlfogle" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt6",
+  "requests",
+]
+
+[project.scripts]
+ollama-manager = "ollama_manager_gui:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
