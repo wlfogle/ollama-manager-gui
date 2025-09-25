@@ -4,11 +4,13 @@ import re
 import json
 import hashlib
 import threading
+import time
 from pathlib import Path
 import requests
 from typing import Optional, Iterable, Dict, List, Set
 from PyQt6.QtWidgets import QDialog, QFormLayout, QSpinBox, QDialogButtonBox, QCheckBox
 from network_client import hf_headers, get_json_with_retry
+from download_manager import DownloadManager, DownloadJob, DownloadStatus
 
 from PyQt6.QtCore import pyqtSignal, QObject, Qt
 from PyQt6.QtWidgets import (
@@ -724,6 +726,30 @@ class MainWindow(QMainWindow):
         row2.addStretch(1)
         row2.addWidget(download_sel_btn)
         discover_layout.addLayout(row2)
+
+        # Download Queue section
+        queue_group = QGroupBox("Download Queue")
+        queue_v = QVBoxLayout()
+        self.queue_list = QListWidget()
+        queue_buttons = QHBoxLayout()
+        self.queue_pause_btn = QPushButton("Pause")
+        self.queue_resume_btn = QPushButton("Resume")
+        self.queue_cancel_btn = QPushButton("Cancel")
+        self.queue_clear_btn = QPushButton("Clear Completed")
+        self.queue_pause_btn.clicked.connect(self.queue_pause_selected)
+        self.queue_resume_btn.clicked.connect(self.queue_resume_selected)
+        self.queue_cancel_btn.clicked.connect(self.queue_cancel_selected)
+        self.queue_clear_btn.clicked.connect(self.queue_clear_completed)
+        queue_buttons.addWidget(self.queue_pause_btn)
+        queue_buttons.addWidget(self.queue_resume_btn)
+        queue_buttons.addWidget(self.queue_cancel_btn)
+        queue_buttons.addStretch(1)
+        queue_buttons.addWidget(self.queue_clear_btn)
+        queue_v.addWidget(self.queue_list)
+        queue_v.addLayout(queue_buttons)
+        queue_group.setLayout(queue_v)
+        discover_layout.addWidget(queue_group)
+
         discover_page.setLayout(discover_layout)
         # Auto-load when switching source so the list matches the picker
         self.site_combo.currentIndexChanged.connect(self.on_site_changed)
@@ -749,6 +775,18 @@ class MainWindow(QMainWindow):
         self._discover_cache: Dict[str, List[dict]] = {}
         self._discover_page: int = 0
         self._discover_page_size: int = 50
+
+        # Download manager
+        def import_into_ollama(name: str, path: Path):
+            modelfile = f"FROM {path}\n"
+            self.client.create_model(name, modelfile)
+        self.dl_manager = DownloadManager(
+            max_concurrency=2,
+            on_progress=self.on_download_progress,
+            on_done=self.on_download_done,
+        )
+        self._queue_items: Dict[str, QListWidgetItem] = {}
+        self._import_cb = import_into_ollama
 
         # Initial load
         self.refresh_models()
@@ -1093,34 +1131,30 @@ class MainWindow(QMainWindow):
             cache_dir = Path.home() / ".cache" / "ollama-manager-gui" / "downloads"
             cache_dir.mkdir(parents=True, exist_ok=True)
             target_file = cache_dir / f"{repo_id.replace('/', '_')}__{Path(gguf_path).name}"
-            dlg = QProgressDialog("Downloading…", "Cancel", 0, 0, self)
-            dlg.setWindowTitle("Download and Import")
-            dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
-            dlg.setAutoClose(True)
-            dlg.setAutoReset(True)
-            dlg.setMinimumDuration(0)
-            worker = DownloadAndCreateWorker(url=url, dest=target_file, client=self.client, model_name=suggested_name)
-            def run():
-                worker.start()
-            def on_progress(msg: str):
-                self.status.showMessage(msg, 2000)
-                self.maint_output.appendPlainText(msg)
-            def on_finished(ok: bool, message: str):
-                dlg.reset()
-                if ok:
-                    self.status.showMessage(f"Imported model: {suggested_name}", 5000)
-                    self.refresh_models()
-                else:
-                    QMessageBox.critical(self, "Import failed", message or "Unknown error")
-            worker.progress.connect(on_progress)
-            worker.finished.connect(on_finished)
-            threading.Thread(target=run, daemon=True).start()
-            dlg.exec()
+            # create job
+            job_id = f"{provider}:{suggested_name}:{int(threading.get_ident())}:{int(time.time())}"
+            size = data.get('size') or data.get('head_size')
+            sha256 = data.get('sha256')
+            job = DownloadJob(
+                job_id=job_id,
+                url=url,
+                dest=target_file,
+                provider=provider,
+                suggested_name=suggested_name,
+                repo_id=repo_id,
+                gguf_path=gguf_path,
+                size=size if isinstance(size, int) else None,
+                sha256=sha256,
+                ollama_import=self._import_cb,
+            )
+            self._enqueue_job(job)
         else:
             name = data.get("name")
             if not name:
                 QMessageBox.critical(self, "Download", "Invalid selection data.")
                 return
+            # simpler: queue a pull job by wrapping a small gguf-less job that only imports via ollama pull
+            # Here we directly call pull as before
             self._pull_with_progress(name)
 
 
@@ -1412,6 +1446,83 @@ class MainWindow(QMainWindow):
         if url:
             try:
                 webbrowser.open(url)
+            except Exception:
+                pass
+
+    # ======== Download queue integration ========
+    def _enqueue_job(self, job: DownloadJob):
+        self.dl_manager.add_job(job)
+        it = QListWidgetItem(self._queue_item_text(job))
+        it.setData(Qt.ItemDataRole.UserRole, job.job_id)
+        self.queue_list.addItem(it)
+        self._queue_items[job.job_id] = it
+
+    def _queue_item_text(self, job: DownloadJob) -> str:
+        # build a status line
+        name = job.suggested_name or job.dest.name
+        st = job.status
+        total = job.total or 0
+        done = job.downloaded
+        pct = (done * 100 // total) if total else 0
+        sz = f"{self._human_size(done)}/{self._human_size(total) if total else '?'}"
+        return f"[{st}] {name} — {pct}% ({sz})"
+
+    def on_download_progress(self, job: DownloadJob):
+        it = self._queue_items.get(job.job_id)
+        if it:
+            it.setText(self._queue_item_text(job))
+
+    def on_download_done(self, job: DownloadJob):
+        it = self._queue_items.get(job.job_id)
+        if it:
+            it.setText(self._queue_item_text(job))
+        # on complete import, refresh models
+        if job.status == DownloadStatus.DONE:
+            self.status.showMessage(f"Imported model: {job.suggested_name}", 5000)
+            try:
+                self.refresh_models()
+            except Exception:
+                pass
+        elif job.status in (DownloadStatus.FAILED, DownloadStatus.CANCELED):
+            self.status.showMessage(f"Download {job.status}: {job.error or ''}", 7000)
+
+    def _queue_selected_job_id(self) -> Optional[str]:
+        it = self.queue_list.currentItem()
+        if not it:
+            return None
+        job_id = it.data(Qt.ItemDataRole.UserRole)
+        return job_id
+
+    def queue_pause_selected(self):
+        jid = self._queue_selected_job_id()
+        if jid:
+            self.dl_manager.pause_job(jid)
+
+    def queue_resume_selected(self):
+        jid = self._queue_selected_job_id()
+        if jid:
+            self.dl_manager.resume_job(jid)
+
+    def queue_cancel_selected(self):
+        jid = self._queue_selected_job_id()
+        if jid:
+            self.dl_manager.cancel_job(jid)
+
+    def queue_clear_completed(self):
+        # remove DONE/FAILED/CANCELED items from list and map
+        remove_rows: List[int] = []
+        for row in range(self.queue_list.count()):
+            it = self.queue_list.item(row)
+            jid = it.data(Qt.ItemDataRole.UserRole)
+            job = self.dl_manager.find_job(jid) if jid else None
+            if job and job.status in (DownloadStatus.DONE, DownloadStatus.FAILED, DownloadStatus.CANCELED):
+                remove_rows.append(row)
+        for row in reversed(remove_rows):
+            it = self.queue_list.takeItem(row)
+            try:
+                jid = it.data(Qt.ItemDataRole.UserRole)
+                if jid in self._queue_items:
+                    del self._queue_items[jid]
             except Exception:
                 pass
 
