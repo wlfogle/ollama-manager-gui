@@ -304,7 +304,12 @@ class HuggingFaceDiscoverWorker(QObject):
             params = {"limit": self.limit, "sort": "downloads"}
             r = requests.get("https://huggingface.co/api/models", params=params, timeout=20)
             r.raise_for_status()
-            for repo in r.json():
+            repos = r.json()
+            if not isinstance(repos, list):
+                self.progress.emit("Unexpected response from Hugging Face")
+                self.finished.emit(results)
+                return
+            for repo in repos:
                 repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id")
                 if not repo_id:
                     continue
@@ -312,7 +317,9 @@ class HuggingFaceDiscoverWorker(QObject):
                 if rd.status_code != 200:
                     continue
                 info = rd.json()
-                title = info.get("cardData", {}).get("title") or repo_id
+                card = info.get("cardData") or {}
+                # Prefer a short summary-like field if present
+                summary = card.get("summary") or card.get("description") or card.get("title") or info.get("pipeline_tag") or repo_id
                 siblings = info.get("siblings") or []
                 ggufs = [s for s in siblings if isinstance(s, dict) and str(s.get("rfilename", "")).lower().endswith(".gguf")]
                 for s in ggufs:
@@ -328,7 +335,7 @@ class HuggingFaceDiscoverWorker(QObject):
                         "gguf_path": gguf_path,
                         "url": url,
                         "suggested_name": suggested_name,
-                        "title": title,
+                        "desc": str(summary)[:160],
                     })
             self.finished.emit(results)
         except Exception as e:
@@ -377,11 +384,31 @@ class DownloadAndCreateWorker(QObject):
 
 class OllamaLibraryDiscoverWorker(QObject):
     progress = pyqtSignal(str)
-    finished = pyqtSignal(list)  # list of dicts {name}
+    finished = pyqtSignal(list)  # list of dicts {name, desc}
 
-    def __init__(self, installed_names: Set[str]):
+    def __init__(self, installed_names: Set[str], limit: int = 200):
         super().__init__()
         self.installed_names = installed_names
+        self.limit = max(1, min(limit, 500))
+
+    def fetch_desc(self, name: str) -> str:
+        try:
+            d = requests.get(f"https://ollama.com/library/{name}", timeout=15)
+            if d.status_code != 200:
+                return "Ollama Library model"
+            page = d.text
+            m = re.search(r'<meta\s+name="description"\s+content="([^"]+)', page, re.IGNORECASE)
+            if m:
+                return m.group(1)[:160]
+            # fallback: first paragraph
+            m2 = re.search(r"<p>(.*?)</p>", page, re.IGNORECASE | re.DOTALL)
+            if m2:
+                # strip tags crudely
+                text = re.sub(r"<[^>]+>", " ", m2.group(1))
+                return re.sub(r"\s+", " ", text).strip()[:160]
+        except Exception:
+            pass
+        return "Ollama Library model"
 
     def start(self):
         results: List[dict] = []
@@ -389,11 +416,16 @@ class OllamaLibraryDiscoverWorker(QObject):
             r = requests.get("https://ollama.com/library", timeout=20)
             r.raise_for_status()
             html = r.text
-            names = set(m.group(1) for m in re.finditer(r"/library/([a-zA-Z0-9_.:-]+)", html))
-            for name in sorted(names):
+            names = sorted(set(m.group(1) for m in re.finditer(r"/library/([a-zA-Z0-9_.:-]+)", html)))
+            count = 0
+            for name in names:
                 if name in self.installed_names:
                     continue
-                results.append({"name": name})
+                desc = self.fetch_desc(name)
+                results.append({"name": name, "desc": desc})
+                count += 1
+                if count >= self.limit:
+                    break
             self.finished.emit(results)
         except Exception as e:
             self.progress.emit(f"Discover error: {e}")
@@ -844,12 +876,14 @@ class MainWindow(QMainWindow):
         def on_finished(results: List[dict]):
             for r in results:
                 if "suggested_name" in r:
-                    text = f"{r['suggested_name']} — {r['repo_id']} [{r['gguf_path']}]"
+                    text = f"{r['suggested_name']} — {r.get('desc','')}"
                 else:
-                    text = r.get("name", "<unknown>")
+                    text = f"{r.get('name','<unknown>')} — {r.get('desc','')}"
                 item = QListWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, r)
                 self.discover_list.addItem(item)
+            if not results:
+                QMessageBox.information(self, "Discover", "No models found from the selected source (or all are already installed).")
             self.status.showMessage(f"Found {len(results)} models not installed", 5000)
 
         worker.progress.connect(on_progress)
