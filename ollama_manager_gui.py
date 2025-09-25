@@ -292,23 +292,22 @@ class HuggingFaceDiscoverWorker(QObject):
     progress = pyqtSignal(str)
     finished = pyqtSignal(list)  # list of result dicts
 
-    def __init__(self, query: str, installed_names: Set[str]):
+    def __init__(self, installed_names: Set[str], limit: int = 50):
         super().__init__()
-        self.query = query
         self.installed_names = installed_names
+        self.limit = max(1, min(limit, 200))
 
     def start(self):
         results: List[dict] = []
         try:
-            # Search HF models
-            params = {"search": self.query, "limit": 20}
+            # Get popular models (sorted by downloads)
+            params = {"limit": self.limit, "sort": "downloads"}
             r = requests.get("https://huggingface.co/api/models", params=params, timeout=20)
             r.raise_for_status()
             for repo in r.json():
                 repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id")
                 if not repo_id:
                     continue
-                # Fetch model details to list files
                 rd = requests.get(f"https://huggingface.co/api/models/{repo_id}", timeout=20)
                 if rd.status_code != 200:
                     continue
@@ -333,7 +332,6 @@ class HuggingFaceDiscoverWorker(QObject):
                     })
             self.finished.emit(results)
         except Exception as e:
-            # Emit empty results on error; UI will simply show 0
             self.progress.emit(f"Discover error: {e}")
             self.finished.emit(results)
 
@@ -503,9 +501,6 @@ class MainWindow(QMainWindow):
         self.site_combo.addItem("Ollama Library", "ollama")
         self.site_combo.addItem("Hugging Face (GGUF)", "hf_gguf")
         row1.addWidget(self.site_combo)
-        self.discover_query = QLineEdit()
-        self.discover_query.setPlaceholderText("search (Hugging Face)")
-        row1.addWidget(self.discover_query)
         load_btn = QPushButton("Load")
         load_btn.clicked.connect(self.discover_search)
         row1.addWidget(load_btn)
@@ -536,12 +531,6 @@ class MainWindow(QMainWindow):
         self.dir_input.setText(self.config.get("models_dir", ""))
         self.update_models_dir_status()
         self.dir_input.editingFinished.connect(self.on_models_dir_changed)
-
-        def on_site_changed(_i: int):
-            provider = self.site_combo.currentData()
-            self.discover_query.setEnabled(provider == "hf_gguf")
-        self.site_combo.currentIndexChanged.connect(on_site_changed)
-        on_site_changed(self.site_combo.currentIndex())
 
         # Initial load
         self.refresh_models()
@@ -842,11 +831,7 @@ class MainWindow(QMainWindow):
             installed = set()
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
         if provider == "hf_gguf":
-            query = (self.discover_query.text() or "").strip()
-            if not query:
-                QMessageBox.information(self, "Discover", "Enter a Hugging Face search query.")
-                return
-            worker = HuggingFaceDiscoverWorker(query=query, installed_names=installed)
+            worker = HuggingFaceDiscoverWorker(installed_names=installed, limit=50)
         else:
             worker = OllamaLibraryDiscoverWorker(installed_names=installed)
 
