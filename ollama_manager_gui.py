@@ -33,6 +33,10 @@ from PyQt6.QtWidgets import (
 
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
+# Simple headers for outbound requests to avoid being blocked by providers
+HF_HEADERS = {"User-Agent": "ollama-manager-gui/1.0 (+https://github.com/wlfogle/ollama-manager-gui)", "Accept": "application/json"}
+OLLAMA_LIB_HEADERS = {"User-Agent": "ollama-manager-gui/1.0", "Accept": "text/html"}
+
 # Simple config helpers
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "ollama-manager-gui")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -302,7 +306,7 @@ class HuggingFaceDiscoverWorker(QObject):
         try:
             # Get popular models (sorted by downloads)
             params = {"limit": self.limit, "sort": "downloads"}
-            r = requests.get("https://huggingface.co/api/models", params=params, timeout=20)
+            r = requests.get("https://huggingface.co/api/models", params=params, headers=HF_HEADERS, timeout=30)
             r.raise_for_status()
             repos = r.json()
             if not isinstance(repos, list):
@@ -313,7 +317,7 @@ class HuggingFaceDiscoverWorker(QObject):
                 repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id")
                 if not repo_id:
                     continue
-                rd = requests.get(f"https://huggingface.co/api/models/{repo_id}", timeout=20)
+                rd = requests.get(f"https://huggingface.co/api/models/{repo_id}", headers=HF_HEADERS, timeout=30)
                 if rd.status_code != 200:
                     continue
                 info = rd.json()
@@ -340,6 +344,57 @@ class HuggingFaceDiscoverWorker(QObject):
             self.finished.emit(results)
         except Exception as e:
             self.progress.emit(f"Discover error: {e}")
+            self.finished.emit(results)
+
+
+class HuggingFaceTheBlokeWorker(QObject):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(list)
+
+    def __init__(self, installed_names: Set[str], limit: int = 50):
+        super().__init__()
+        self.installed_names = installed_names
+        self.limit = max(1, min(limit, 200))
+
+    def start(self):
+        results: List[dict] = []
+        try:
+            params = {"limit": self.limit, "sort": "downloads", "search": "TheBloke"}
+            r = requests.get("https://huggingface.co/api/models", params=params, headers=HF_HEADERS, timeout=30)
+            r.raise_for_status()
+            repos = r.json()
+            if not isinstance(repos, list):
+                self.finished.emit(results)
+                return
+            for repo in repos:
+                repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id")
+                if not repo_id:
+                    continue
+                rd = requests.get(f"https://huggingface.co/api/models/{repo_id}", headers=HF_HEADERS, timeout=30)
+                if rd.status_code != 200:
+                    continue
+                info = rd.json()
+                card = info.get("cardData") or {}
+                summary = card.get("summary") or card.get("description") or card.get("title") or info.get("pipeline_tag") or repo_id
+                siblings = info.get("siblings") or []
+                ggufs = [s for s in siblings if isinstance(s, dict) and str(s.get("rfilename", "")).lower().endswith(".gguf")]
+                for s in ggufs:
+                    gguf_path = s.get("rfilename")
+                    if not gguf_path:
+                        continue
+                    url = f"https://huggingface.co/{repo_id}/resolve/main/{gguf_path}"
+                    suggested_name = f"hf/{repo_id}:{Path(gguf_path).stem}"
+                    if suggested_name in self.installed_names:
+                        continue
+                    results.append({
+                        "repo_id": repo_id,
+                        "gguf_path": gguf_path,
+                        "url": url,
+                        "suggested_name": suggested_name,
+                        "desc": str(summary)[:160],
+                    })
+            self.finished.emit(results)
+        except Exception:
             self.finished.emit(results)
 
 
@@ -393,7 +448,7 @@ class OllamaLibraryDiscoverWorker(QObject):
 
     def fetch_desc(self, name: str) -> str:
         try:
-            d = requests.get(f"https://ollama.com/library/{name}", timeout=15)
+            d = requests.get(f"https://ollama.com/library/{name}", headers=OLLAMA_LIB_HEADERS, timeout=30)
             if d.status_code != 200:
                 return "Ollama Library model"
             page = d.text
@@ -413,7 +468,7 @@ class OllamaLibraryDiscoverWorker(QObject):
     def start(self):
         results: List[dict] = []
         try:
-            r = requests.get("https://ollama.com/library", timeout=20)
+            r = requests.get("https://ollama.com/library", headers=OLLAMA_LIB_HEADERS, timeout=30)
             r.raise_for_status()
             html = r.text
             names = sorted(set(m.group(1) for m in re.finditer(r"/library/([a-zA-Z0-9_.:-]+)", html)))
@@ -524,7 +579,7 @@ class MainWindow(QMainWindow):
         maintenance_layout.addWidget(maint_group)
         maintenance_page.setLayout(maintenance_layout)
 
-        # ========== Build Discovery tab ==========
+# ========== Build Discovery tab ==========
         discover_page = QWidget()
         discover_layout = QVBoxLayout()
         row1 = QHBoxLayout()
@@ -532,6 +587,7 @@ class MainWindow(QMainWindow):
         self.site_combo = QComboBox()
         self.site_combo.addItem("Ollama Library", "ollama")
         self.site_combo.addItem("Hugging Face (GGUF)", "hf_gguf")
+        self.site_combo.addItem("Hugging Face (TheBloke GGUF)", "hf_thebloke")
         row1.addWidget(self.site_combo)
         load_btn = QPushButton("Load")
         load_btn.clicked.connect(self.discover_search)
@@ -864,6 +920,8 @@ class MainWindow(QMainWindow):
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
         if provider == "hf_gguf":
             worker = HuggingFaceDiscoverWorker(installed_names=installed, limit=50)
+        elif provider == "hf_thebloke":
+            worker = HuggingFaceTheBlokeWorker(installed_names=installed, limit=50)
         else:
             worker = OllamaLibraryDiscoverWorker(installed_names=installed)
 
