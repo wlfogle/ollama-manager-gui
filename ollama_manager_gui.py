@@ -4,6 +4,7 @@ import re
 import json
 import hashlib
 import threading
+import time
 from pathlib import Path
 import requests
 from typing import Optional, Iterable, Dict, List, Set
@@ -36,6 +37,33 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 # Simple headers for outbound requests to avoid being blocked by providers
 HF_HEADERS = {"User-Agent": "ollama-manager-gui/1.0 (+https://github.com/wlfogle/ollama-manager-gui)", "Accept": "application/json"}
 OLLAMA_LIB_HEADERS = {"User-Agent": "ollama-manager-gui/1.0", "Accept": "text/html"}
+
+def hf_headers() -> Dict[str, str]:
+    h = dict(HF_HEADERS)
+    tok = os.environ.get("HF_API_TOKEN") or os.environ.get("HUGGINGFACE_API_TOKEN")
+    if tok:
+        h["Authorization"] = f"Bearer {tok.strip()}"
+    return h
+
+# Basic retry helper for GET JSON endpoints
+def get_json_with_retry(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, retries: int = 3, backoff: float = 1.0):
+    last_err = None
+    for i in range(max(1, retries)):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+            # Handle rate limiting and transient server errors with backoff
+            if r.status_code in (429, 502, 503, 504):
+                time.sleep(backoff * (2 ** i))
+                last_err = Exception(f"HTTP {r.status_code} from {url}")
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff * (2 ** i))
+    if last_err:
+        raise last_err
+    return None
 
 # ---- Utilities for better descriptions ----
 def _extract_size_from_repo(repo_id: str) -> str:
@@ -349,9 +377,7 @@ class HuggingFaceDiscoverWorker(QObject):
         try:
             # Get popular models (sorted by downloads)
             params = {"limit": self.limit, "sort": "downloads"}
-            r = requests.get("https://huggingface.co/api/models", params=params, headers=HF_HEADERS, timeout=30)
-            r.raise_for_status()
-            repos = r.json()
+            repos = get_json_with_retry("https://huggingface.co/api/models", params=params, headers=hf_headers(), retries=3, backoff=1.0)
             if not isinstance(repos, list):
                 self.progress.emit("Unexpected response from Hugging Face")
                 self.finished.emit(results)
@@ -360,10 +386,9 @@ class HuggingFaceDiscoverWorker(QObject):
                 repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id")
                 if not repo_id:
                     continue
-                rd = requests.get(f"https://huggingface.co/api/models/{repo_id}", headers=HF_HEADERS, timeout=30)
-                if rd.status_code != 200:
+                info = get_json_with_retry(f"https://huggingface.co/api/models/{repo_id}", headers=hf_headers(), retries=3, backoff=1.0)
+                if not isinstance(info, dict):
                     continue
-                info = rd.json()
                 siblings = info.get("siblings") or []
                 ggufs = [s for s in siblings if isinstance(s, dict) and str(s.get("rfilename", "")).lower().endswith(".gguf")]
                 for s in ggufs:
@@ -402,9 +427,7 @@ class HuggingFaceTheBlokeWorker(QObject):
         results: List[dict] = []
         try:
             params = {"limit": self.limit, "sort": "downloads", "search": "TheBloke"}
-            r = requests.get("https://huggingface.co/api/models", params=params, headers=HF_HEADERS, timeout=30)
-            r.raise_for_status()
-            repos = r.json()
+            repos = get_json_with_retry("https://huggingface.co/api/models", params=params, headers=hf_headers(), retries=3, backoff=1.0)
             if not isinstance(repos, list):
                 self.finished.emit(results)
                 return
@@ -412,10 +435,9 @@ class HuggingFaceTheBlokeWorker(QObject):
                 repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id")
                 if not repo_id:
                     continue
-                rd = requests.get(f"https://huggingface.co/api/models/{repo_id}", headers=HF_HEADERS, timeout=30)
-                if rd.status_code != 200:
+                info = get_json_with_retry(f"https://huggingface.co/api/models/{repo_id}", headers=hf_headers(), retries=3, backoff=1.0)
+                if not isinstance(info, dict):
                     continue
-                info = rd.json()
                 siblings = info.get("siblings") or []
                 ggufs = [s for s in siblings if isinstance(s, dict) and str(s.get("rfilename", "")).lower().endswith(".gguf")]
                 for s in ggufs:
@@ -636,7 +658,14 @@ class MainWindow(QMainWindow):
         row1.addWidget(load_btn)
         discover_layout.addLayout(row1)
         self.discover_list = QListWidget()
+        self.discover_list.currentItemChanged.connect(self.update_discover_details)
         discover_layout.addWidget(self.discover_list)
+
+        # Details pane for the selected item
+        self.discover_details = QPlainTextEdit()
+        self.discover_details.setReadOnly(True)
+        self.discover_details.setPlaceholderText("Details for selected item…")
+        discover_layout.addWidget(self.discover_details)
         row2 = QHBoxLayout()
         self.prev_btn = QPushButton("Prev")
         self.prev_btn.clicked.connect(self.discover_prev_page)
@@ -1076,6 +1105,7 @@ class MainWindow(QMainWindow):
         start = self._discover_page * page_size
         end = min(start + page_size, total)
         self.discover_list.clear()
+        self.discover_details.clear()
         tag = self._provider_tag(provider)
         for r in results[start:end]:
             p = r.get("provider")
@@ -1101,6 +1131,38 @@ class MainWindow(QMainWindow):
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
         self._discover_page += 1
         self.render_discover_page(provider)
+
+    def _details_text(self, data: dict) -> str:
+        if not data:
+            return ""
+        prov = data.get("provider", "?")
+        lines = [f"provider: {prov}"]
+        if prov in ("hf_gguf", "hf_thebloke"):
+            lines += [
+                f"repo_id: {data.get('repo_id','')}",
+                f"gguf: {data.get('gguf_path','')}",
+                f"suggested: {data.get('suggested_name','')}",
+                f"desc: {data.get('desc','')}",
+                f"url: {data.get('url','')}",
+            ]
+        else:
+            lines += [
+                f"name: {data.get('name','')}",
+                f"desc: {data.get('desc','')}",
+                f"pull: {data.get('name','')}",
+            ]
+        return "\n".join(lines)
+
+    def update_discover_details(self, _cur, _prev=None):
+        item = self.discover_list.currentItem()
+        if not item:
+            self.discover_details.clear()
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict):
+            self.discover_details.setPlainText(self._details_text(data))
+        else:
+            self.discover_details.clear()
 
 
 def main():

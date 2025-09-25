@@ -24,6 +24,7 @@ A full‑GUI manager for local Ollama models: list/update/delete/local maintenan
 - Ollama running locally (default API: http://localhost:11434)
 - Python 3.10+
 - `PyQt6` and `requests`
+- Optional: set `HF_API_TOKEN` to your Hugging Face token to reduce rate limiting
 
 ## Quick start
 ```
