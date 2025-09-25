@@ -4,10 +4,11 @@ import re
 import json
 import hashlib
 import threading
-import time
 from pathlib import Path
 import requests
 from typing import Optional, Iterable, Dict, List, Set
+from PyQt6.QtWidgets import QDialog, QFormLayout, QSpinBox, QDialogButtonBox, QCheckBox
+from network_client import hf_headers, get_json_with_retry
 
 from PyQt6.QtCore import pyqtSignal, QObject, Qt
 from PyQt6.QtWidgets import (
@@ -37,33 +38,6 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 # Simple headers for outbound requests to avoid being blocked by providers
 HF_HEADERS = {"User-Agent": "ollama-manager-gui/1.0 (+https://github.com/wlfogle/ollama-manager-gui)", "Accept": "application/json"}
 OLLAMA_LIB_HEADERS = {"User-Agent": "ollama-manager-gui/1.0", "Accept": "text/html"}
-
-def hf_headers() -> Dict[str, str]:
-    h = dict(HF_HEADERS)
-    tok = os.environ.get("HF_API_TOKEN") or os.environ.get("HUGGINGFACE_API_TOKEN")
-    if tok:
-        h["Authorization"] = f"Bearer {tok.strip()}"
-    return h
-
-# Basic retry helper for GET JSON endpoints
-def get_json_with_retry(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, retries: int = 3, backoff: float = 1.0):
-    last_err = None
-    for i in range(max(1, retries)):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=30)
-            # Handle rate limiting and transient server errors with backoff
-            if r.status_code in (429, 502, 503, 504):
-                time.sleep(backoff * (2 ** i))
-                last_err = Exception(f"HTTP {r.status_code} from {url}")
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff * (2 ** i))
-    if last_err:
-        raise last_err
-    return None
 
 # ---- Utilities for better descriptions ----
 def _extract_size_from_repo(repo_id: str) -> str:
@@ -678,8 +652,29 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.site_combo)
         load_btn = QPushButton("Load")
         load_btn.clicked.connect(self.discover_search)
+        settings_btn = QPushButton("Settings…")
+        settings_btn.clicked.connect(self.open_settings)
         row1.addWidget(load_btn)
+        row1.addWidget(settings_btn)
         discover_layout.addLayout(row1)
+        # Filter row
+        filter_row = QHBoxLayout()
+        self.filter_instruct = QCheckBox("Instruct only")
+        self.filter_min_params = QLineEdit()
+        self.filter_min_params.setPlaceholderText(">= params (e.g., 7B)")
+        self.filter_quant = QLineEdit()
+        self.filter_quant.setPlaceholderText("quant contains (e.g., Q4_K)")
+        self.filter_task = QLineEdit()
+        self.filter_task.setPlaceholderText("task contains (e.g., text-generation)")
+        self.filter_apply_btn = QPushButton("Apply Filters")
+        self.filter_apply_btn.clicked.connect(self.apply_discover_filters)
+        filter_row.addWidget(self.filter_instruct)
+        filter_row.addWidget(self.filter_min_params)
+        filter_row.addWidget(self.filter_quant)
+        filter_row.addWidget(self.filter_task)
+        filter_row.addWidget(self.filter_apply_btn)
+        discover_layout.addLayout(filter_row)
+
         self.discover_list = QListWidget()
         self.discover_list.currentItemChanged.connect(self.update_discover_details)
         discover_layout.addWidget(self.discover_list)
@@ -1039,11 +1034,11 @@ class MainWindow(QMainWindow):
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
         self.status.showMessage(f"Loading from source: {provider}", 3000)
         if provider == "hf_gguf":
-            worker = HuggingFaceDiscoverWorker(installed_names=installed, limit=200)
+            worker = HuggingFaceDiscoverWorker(installed_names=installed, limit=max(50, self._discover_page_size * 5))
         elif provider == "hf_thebloke":
-            worker = HuggingFaceTheBlokeWorker(installed_names=installed, limit=200)
+            worker = HuggingFaceTheBlokeWorker(installed_names=installed, limit=max(50, self._discover_page_size * 5))
         else:
-            worker = OllamaLibraryDiscoverWorker(installed_names=installed, limit=500)
+            worker = OllamaLibraryDiscoverWorker(installed_names=installed, limit=max(200, self._discover_page_size * 10))
 
         def run():
             worker.start()
@@ -1127,8 +1122,66 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Source changed to {provider}. Loading…", 2000)
             self.discover_search()
 
+    def _parse_params_to_number(self, text: str) -> int:
+        # Convert "7B", "13B", "8x7B" into an integer number of parameters
+        s = text.upper()
+        m = re.search(r"(\d+)X(\d+)B", s)
+        if m:
+            try:
+                return int(m.group(1)) * int(m.group(2)) * 1_000_000_000
+            except Exception:
+                pass
+        m2 = re.search(r"(\d+)B", s)
+        if m2:
+            try:
+                return int(m2.group(1)) * 1_000_000_000
+            except Exception:
+                pass
+        return 0
+
+    def get_filtered_results(self, provider: str) -> List[dict]:
+        results = list(self._discover_cache.get(provider, []))
+        if not results:
+            return results
+        # Filters
+        instruct_only = self.filter_instruct.isChecked() if hasattr(self, 'filter_instruct') else False
+        min_params_txt = self.filter_min_params.text().strip() if hasattr(self, 'filter_min_params') else ""
+        quant_sub = (self.filter_quant.text() or "").strip().upper() if hasattr(self, 'filter_quant') else ""
+        task_sub = (self.filter_task.text() or "").strip().lower() if hasattr(self, 'filter_task') else ""
+        min_params = 0
+        if min_params_txt:
+            min_params = self._parse_params_to_number(min_params_txt)
+        out = []
+        for r in results:
+            desc = (r.get('desc') or '').lower()
+            # instruct
+            if instruct_only:
+                if r.get('provider') in ('hf_gguf','hf_thebloke'):
+                    if 'instruct' not in (r.get('suggested_name') or '').lower() and 'instruct' not in desc:
+                        continue
+                else:
+                    if 'instruct' not in (r.get('name') or '').lower() and 'instruct' not in desc:
+                        continue
+            # min params
+            if min_params > 0:
+                # attempt from suggested_name or repo_id
+                ref = r.get('suggested_name') or r.get('repo_id') or r.get('name') or ''
+                pnum = self._parse_params_to_number(ref)
+                if pnum < min_params:
+                    continue
+            # quant substring
+            if quant_sub:
+                q = _extract_quant_from_filename(r.get('gguf_path','')) if r.get('gguf_path') else ''
+                if quant_sub not in q.upper():
+                    continue
+            # task
+            if task_sub and task_sub not in desc:
+                continue
+            out.append(r)
+        return out
+
     def render_discover_page(self, provider: str):
-        results = self._discover_cache.get(provider, [])
+        results = self.get_filtered_results(provider)
         page_size = self._discover_page_size
         total = len(results)
         pages = max(1, (total + page_size - 1) // page_size)
@@ -1167,6 +1220,45 @@ class MainWindow(QMainWindow):
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
         self._discover_page += 1
         self.render_discover_page(provider)
+
+    def apply_discover_filters(self):
+        provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
+        self._discover_page = 0
+        self.render_discover_page(provider)
+
+    def open_settings(self):
+        class SettingsDialog(QDialog):
+            def __init__(self, parent, cfg):
+                super().__init__(parent)
+                self.setWindowTitle("Settings")
+                self.cfg = cfg.copy()
+                form = QFormLayout()
+                self.token = QLineEdit()
+                self.token.setEchoMode(QLineEdit.EchoMode.Password)
+                self.token.setText(self.cfg.get('hf_api_token',''))
+                self.page_size = QSpinBox()
+                self.page_size.setRange(10, 500)
+                self.page_size.setValue(int(parent._discover_page_size))
+                form.addRow("Hugging Face token:", self.token)
+                form.addRow("Discover page size:", self.page_size)
+                buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+                buttons.accepted.connect(self.accept)
+                buttons.rejected.connect(self.reject)
+                layout = QVBoxLayout()
+                layout.addLayout(form)
+                layout.addWidget(buttons)
+                self.setLayout(layout)
+        d = SettingsDialog(self, self.config)
+        if d.exec() == QDialog.DialogCode.Accepted:
+            tok = d.token.text().strip()
+            self.config['hf_api_token'] = tok
+            if tok:
+                os.environ['HF_API_TOKEN'] = tok
+            self._discover_page_size = int(d.page_size.value())
+            try:
+                save_config(self.config)
+            except Exception:
+                pass
 
     def _details_text(self, data: dict) -> str:
         if not data:
