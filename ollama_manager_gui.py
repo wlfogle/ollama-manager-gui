@@ -37,6 +37,49 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 HF_HEADERS = {"User-Agent": "ollama-manager-gui/1.0 (+https://github.com/wlfogle/ollama-manager-gui)", "Accept": "application/json"}
 OLLAMA_LIB_HEADERS = {"User-Agent": "ollama-manager-gui/1.0", "Accept": "text/html"}
 
+# ---- Utilities for better descriptions ----
+def _extract_size_from_repo(repo_id: str) -> str:
+    m = re.search(r"(\d+(?:x\d+)?B)", repo_id, re.IGNORECASE)
+    return (m.group(1) + " params") if m else ""
+
+def _extract_quant_from_filename(fname: str) -> str:
+    # Common GGUF quant patterns like Q4_K_M, Q5_0, Q8_0, Q6_K
+    m = re.search(r"(Q\d[_A-Z0-9]+)", fname.upper())
+    return m.group(1) if m else ""
+
+def _instruct_flag(repo_id: str, fname: str) -> str:
+    s = (repo_id + " " + fname).lower()
+    return "instruct" if "instruct" in s else "base"
+
+def _compose_hf_desc(repo: dict, info: dict, gguf_path: str) -> str:
+    repo_id = repo.get("modelId") or repo.get("id") or repo.get("_id") or ""
+    card = info.get("cardData") or {}
+    task = info.get("pipeline_tag") or card.get("pipeline_tag") or "text-generation"
+    license_ = info.get("license") or card.get("license") or "license:unknown"
+    downloads = repo.get("downloads") or repo.get("downloadsAllTime")
+    size = _extract_size_from_repo(repo_id)
+    quant = _extract_quant_from_filename(gguf_path)
+    ib = _instruct_flag(repo_id, gguf_path)
+    parts = []
+    if size: parts.append(size)
+    if quant: parts.append(quant)
+    if ib: parts.append(ib)
+    parts.append(f"task={task}")
+    parts.append(license_)
+    if downloads: parts.append(f"dl={downloads}")
+    return ", ".join(parts)
+
+def _augment_ollama_desc(txt: str) -> str:
+    size = None
+    m = re.search(r"(\d+(?:x\d+)?)B", txt, re.IGNORECASE)
+    if m: size = m.group(1) + " params"
+    quant = None
+    m2 = re.search(r"(Q\d[_A-Z0-9]+)", txt.upper())
+    if m2: quant = m2.group(1)
+    extras = ", ".join([p for p in [size, quant] if p])
+    base = re.sub(r"\s+", " ", txt).strip()[:160]
+    return f"{base} ({extras})" if extras else base
+
 # Simple config helpers
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "ollama-manager-gui")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -321,9 +364,6 @@ class HuggingFaceDiscoverWorker(QObject):
                 if rd.status_code != 200:
                     continue
                 info = rd.json()
-                card = info.get("cardData") or {}
-                # Prefer a short summary-like field if present
-                summary = card.get("summary") or card.get("description") or card.get("title") or info.get("pipeline_tag") or repo_id
                 siblings = info.get("siblings") or []
                 ggufs = [s for s in siblings if isinstance(s, dict) and str(s.get("rfilename", "")).lower().endswith(".gguf")]
                 for s in ggufs:
@@ -334,12 +374,14 @@ class HuggingFaceDiscoverWorker(QObject):
                     suggested_name = f"hf/{repo_id}:{Path(gguf_path).stem}"
                     if suggested_name in self.installed_names:
                         continue
+                    desc = _compose_hf_desc(repo, info, gguf_path)
                     results.append({
+                        "provider": "hf_gguf",
                         "repo_id": repo_id,
                         "gguf_path": gguf_path,
                         "url": url,
                         "suggested_name": suggested_name,
-                        "desc": str(summary)[:160],
+                        "desc": desc,
                     })
             self.finished.emit(results)
         except Exception as e:
@@ -374,8 +416,6 @@ class HuggingFaceTheBlokeWorker(QObject):
                 if rd.status_code != 200:
                     continue
                 info = rd.json()
-                card = info.get("cardData") or {}
-                summary = card.get("summary") or card.get("description") or card.get("title") or info.get("pipeline_tag") or repo_id
                 siblings = info.get("siblings") or []
                 ggufs = [s for s in siblings if isinstance(s, dict) and str(s.get("rfilename", "")).lower().endswith(".gguf")]
                 for s in ggufs:
@@ -386,12 +426,14 @@ class HuggingFaceTheBlokeWorker(QObject):
                     suggested_name = f"hf/{repo_id}:{Path(gguf_path).stem}"
                     if suggested_name in self.installed_names:
                         continue
+                    desc = _compose_hf_desc(repo, info, gguf_path)
                     results.append({
+                        "provider": "hf_thebloke",
                         "repo_id": repo_id,
                         "gguf_path": gguf_path,
                         "url": url,
                         "suggested_name": suggested_name,
-                        "desc": str(summary)[:160],
+                        "desc": desc,
                     })
             self.finished.emit(results)
         except Exception:
@@ -476,8 +518,8 @@ class OllamaLibraryDiscoverWorker(QObject):
             for name in names:
                 if name in self.installed_names:
                     continue
-                desc = self.fetch_desc(name)
-                results.append({"name": name, "desc": desc})
+                desc = _augment_ollama_desc(self.fetch_desc(name))
+                results.append({"provider": "ollama", "name": name, "desc": desc})
                 count += 1
                 if count >= self.limit:
                     break
@@ -596,8 +638,16 @@ class MainWindow(QMainWindow):
         self.discover_list = QListWidget()
         discover_layout.addWidget(self.discover_list)
         row2 = QHBoxLayout()
+        self.prev_btn = QPushButton("Prev")
+        self.prev_btn.clicked.connect(self.discover_prev_page)
+        self.page_label = QLabel("Page 1/1")
+        self.next_btn = QPushButton("Next")
+        self.next_btn.clicked.connect(self.discover_next_page)
         download_sel_btn = QPushButton("Download Selected")
         download_sel_btn.clicked.connect(self.discover_download_selected)
+        row2.addWidget(self.prev_btn)
+        row2.addWidget(self.page_label)
+        row2.addWidget(self.next_btn)
         row2.addStretch(1)
         row2.addWidget(download_sel_btn)
         discover_layout.addLayout(row2)
@@ -619,6 +669,11 @@ class MainWindow(QMainWindow):
         self.dir_input.setText(self.config.get("models_dir", ""))
         self.update_models_dir_status()
         self.dir_input.editingFinished.connect(self.on_models_dir_changed)
+
+        # Pagination state
+        self._discover_cache: Dict[str, List[dict]] = {}
+        self._discover_page: int = 0
+        self._discover_page_size: int = 50
 
         # Initial load
         self.refresh_models()
@@ -910,7 +965,7 @@ class MainWindow(QMainWindow):
         thread.start()
         dlg.exec()
 
-    # ========== Discover tab logic ==========
+# ========== Discover tab logic ==========
     def discover_search(self):
         self.discover_list.clear()
         try:
@@ -918,12 +973,13 @@ class MainWindow(QMainWindow):
         except Exception:
             installed = set()
         provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
+        self.status.showMessage(f"Loading from source: {provider}", 3000)
         if provider == "hf_gguf":
-            worker = HuggingFaceDiscoverWorker(installed_names=installed, limit=50)
+            worker = HuggingFaceDiscoverWorker(installed_names=installed, limit=200)
         elif provider == "hf_thebloke":
-            worker = HuggingFaceTheBlokeWorker(installed_names=installed, limit=50)
+            worker = HuggingFaceTheBlokeWorker(installed_names=installed, limit=200)
         else:
-            worker = OllamaLibraryDiscoverWorker(installed_names=installed)
+            worker = OllamaLibraryDiscoverWorker(installed_names=installed, limit=500)
 
         def run():
             worker.start()
@@ -932,17 +988,10 @@ class MainWindow(QMainWindow):
             self.status.showMessage(msg, 2000)
 
         def on_finished(results: List[dict]):
-            for r in results:
-                if "suggested_name" in r:
-                    text = f"{r['suggested_name']} — {r.get('desc','')}"
-                else:
-                    text = f"{r.get('name','<unknown>')} — {r.get('desc','')}"
-                item = QListWidgetItem(text)
-                item.setData(Qt.ItemDataRole.UserRole, r)
-                self.discover_list.addItem(item)
-            if not results:
-                QMessageBox.information(self, "Discover", "No models found from the selected source (or all are already installed).")
-            self.status.showMessage(f"Found {len(results)} models not installed", 5000)
+            # cache and render page 0
+            self._discover_cache[provider] = results
+            self._discover_page = 0
+            self.render_discover_page(provider)
 
         worker.progress.connect(on_progress)
         worker.finished.connect(on_finished)
@@ -956,8 +1005,9 @@ class MainWindow(QMainWindow):
         data = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(data, dict):
             return
-        provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
-        if provider == "hf_gguf":
+        # Use the item's provider so switching the combo later doesn't break downloads
+        provider = data.get("provider") or (self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf')
+        if provider in ("hf_gguf", "hf_thebloke"):
             suggested_name = data.get("suggested_name")
             url = data.get("url")
             gguf_path = data.get("gguf_path")
@@ -997,6 +1047,41 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Download", "Invalid selection data.")
                 return
             self._pull_with_progress(name)
+
+
+    def render_discover_page(self, provider: str):
+        results = self._discover_cache.get(provider, [])
+        page_size = self._discover_page_size
+        total = len(results)
+        pages = max(1, (total + page_size - 1) // page_size)
+        # Clamp page index
+        if self._discover_page >= pages:
+            self._discover_page = pages - 1
+        start = self._discover_page * page_size
+        end = min(start + page_size, total)
+        self.discover_list.clear()
+        for r in results[start:end]:
+            if "suggested_name" in r:
+                text = f"{r['suggested_name']} — {r.get('desc','')}"
+            else:
+                text = f"{r.get('name','<unknown>')} — {r.get('desc','')}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, r)
+            self.discover_list.addItem(item)
+        self.page_label.setText(f"Page {self._discover_page+1}/{pages}")
+        self.prev_btn.setEnabled(self._discover_page > 0)
+        self.next_btn.setEnabled(self._discover_page+1 < pages)
+
+    def discover_prev_page(self):
+        provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
+        if self._discover_page > 0:
+            self._discover_page -= 1
+            self.render_discover_page(provider)
+
+    def discover_next_page(self):
+        provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
+        self._discover_page += 1
+        self.render_discover_page(provider)
 
 
 def main():
