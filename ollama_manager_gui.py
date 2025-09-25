@@ -652,6 +652,8 @@ class MainWindow(QMainWindow):
         row2.addWidget(download_sel_btn)
         discover_layout.addLayout(row2)
         discover_page.setLayout(discover_layout)
+        # Auto-load when switching source so the list matches the picker
+        self.site_combo.currentIndexChanged.connect(self.on_site_changed)
 
         tabs = QTabWidget()
         tabs.addTab(models_page, "Models")
@@ -1049,6 +1051,20 @@ class MainWindow(QMainWindow):
             self._pull_with_progress(name)
 
 
+    def _provider_tag(self, provider: str) -> str:
+        return {"ollama": "OLLAMA", "hf_gguf": "HF", "hf_thebloke": "HF-TB"}.get(provider or "", "?")
+
+    def on_site_changed(self, _index: int):
+        # Auto-fetch or render cache for the selected provider
+        provider = self.site_combo.currentData() if hasattr(self, 'site_combo') else 'hf_gguf'
+        self._discover_page = 0
+        if provider in self._discover_cache and self._discover_cache[provider]:
+            self.render_discover_page(provider)
+        else:
+            self.discover_list.clear()
+            self.status.showMessage(f"Source changed to {provider}. Loading…", 2000)
+            self.discover_search()
+
     def render_discover_page(self, provider: str):
         results = self._discover_cache.get(provider, [])
         page_size = self._discover_page_size
@@ -1060,11 +1076,14 @@ class MainWindow(QMainWindow):
         start = self._discover_page * page_size
         end = min(start + page_size, total)
         self.discover_list.clear()
+        tag = self._provider_tag(provider)
         for r in results[start:end]:
+            p = r.get("provider")
+            itag = self._provider_tag(p) if p else tag
             if "suggested_name" in r:
-                text = f"{r['suggested_name']} — {r.get('desc','')}"
+                text = f"[{itag}] {r['suggested_name']} — {r.get('desc','')}"
             else:
-                text = f"{r.get('name','<unknown>')} — {r.get('desc','')}"
+                text = f"[{itag}] {r.get('name','<unknown>')} — {r.get('desc','')}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, r)
             self.discover_list.addItem(item)
