@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ollama Workshop",
+  "version": "0.2.0",
+  "identifier": "dev.ollama.workshop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "Ollama Workshop", "width": 1280, "height": 900, "minWidth": 900, "minHeight": 650 }],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "resources": {
+      "../worker/main.py": "worker/main.py",
+      "../worker/data.py": "worker/data.py",
+      "../worker/services.py": "worker/services.py",
+      "../worker/training.py": "worker/training.py",
+      "../worker/requirements.txt": "worker/requirements.txt",
+      "../worker/requirements-tested.txt": "worker/requirements-tested.txt"
+    },
+    "icon": ["icons/icon.png"],
+    "linux": {
+      "deb": { "depends": ["python3 (>= 3.10)", "git"] }
+    }
+  }
+}

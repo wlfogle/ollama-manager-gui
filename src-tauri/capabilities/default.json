@@ -1,0 +1,6 @@
+{
+  "identifier": "desktop",
+  "description": "Local desktop IPC events only; no generic shell or filesystem plugin access",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
