@@ -16,3 +16,9 @@ __pycache__/
 /tmp/
 *.log
 /.pytest_cache/
+# Desktop build and training environments
+/node_modules/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+/.training-venv/
+/coverage/

@@ -3,6 +3,24 @@
 This file provides guidance to WARP (warp.dev) when working with code in this repository.
 
 Project overview
+- The new Rust/Tauri 2 desktop app is `src-tauri/` + `src/`, with a bundled
+  Python worker under `worker/`. The original PyQt implementation below is
+  preserved. Read README for storage boundaries and supported workflows.
+- Desktop commands: `npm ci --ignore-scripts`, `npm run tauri dev`,
+  `npm run build`, `npm test`, `cargo test --manifest-path src-tauri/Cargo.toml`,
+  `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`.
+- Worker checks: `python3 -m unittest discover -s worker -p test_worker.py -v`,
+  `ruff check worker`, `black --check worker`. Optional CUDA/native smoke tests
+  are documented in README; never claim model quality from random tiny fixtures.
+- `worker/verify_installed_training.py` verifies retained artifacts from a
+  completed installed-GUI training run, then resumes/exports using the installed
+  worker. Keep that scope distinct from an all-GUI resume/export test.
+- Ingestion only reads approved Git roots and never executes repository code.
+  Preserve ignore/secret/symlink filtering, immutable datasets, file-grouped
+  splits, and provenance. Never store HF tokens in settings, logs, or job files.
+- Default Ollama store is the user's external models directory from README.
+  App workspace must be separate and non-nested. New metadata layouts mean
+  read-only scans; no destructive blob cleanup.
 - A PyQt6 desktop GUI to manage local Ollama models: list/update/delete, perform maintenance on the models directory, and discover/download models from the Ollama Library and Hugging Face (including TheBloke).
 - Requires Ollama running locally (default API http://localhost:11434) and Python 3.10+.
 - Core dependencies: PyQt6, requests. Optional: HF_API_TOKEN/HUGGINGFACE_API_TOKEN to reduce HF rate limiting.
@@ -31,7 +49,8 @@ Common commands
   - mypy --ignore-missing-imports --follow-untyped-imports .
 
 Notes
-- No test suite is present in this repo at the time of writing.
+- The legacy PyQt implementation has no dedicated test suite. Worker, frontend,
+  Rust, CUDA, and native integration tests exist for the new desktop app.
 - A console entry point is declared (pyproject [project.scripts]: ollama-manager -> ollama_manager_gui:main). Packaging may require adding py_modules configuration if building wheels; local development runs the app directly with python ollama_manager_gui.py.
 
 Configuration and environment

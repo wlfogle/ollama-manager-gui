@@ -1,0 +1,12 @@
+# Tested Linux x86_64 / Python 3.10 / CUDA 12.8 integration environment.
+# Install PyTorch from its official CUDA index first (see README).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+transformers==4.57.6
+peft==0.18.1
+accelerate==1.15.0
+bitsandbytes==0.49.2
+huggingface-hub==0.36.2
+safetensors==0.8.0
+tokenizers==0.22.2
+numpy==2.2.6
